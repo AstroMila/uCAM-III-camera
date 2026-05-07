@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Ports;
 using System.Threading;
@@ -12,6 +13,30 @@ namespace UcamIII.Protocol
     /// </summary>
     public class UcamCamera : IDisposable
     {
+        public readonly struct PowerProfilePoint
+        {
+            public DateTimeOffset TimestampUtc { get; }
+            public string Step { get; }
+
+            public PowerProfilePoint(DateTimeOffset timestampUtc, string step)
+            {
+                TimestampUtc = timestampUtc;
+                Step = step;
+            }
+        }
+
+        public sealed class CaptureProfileResult
+        {
+            public byte[] ImageData { get; }
+            public IReadOnlyList<PowerProfilePoint> Points { get; }
+
+            public CaptureProfileResult(byte[] imageData, IReadOnlyList<PowerProfilePoint> points)
+            {
+                ImageData = imageData;
+                Points = points;
+            }
+        }
+
         private readonly SerialPort _port;
         private bool _synced;
         private bool _disposed;
@@ -141,31 +166,66 @@ namespace UcamIII.Protocol
         ///   8. Send final ACK with package ID 0xF0F0
         /// </summary>
         public byte[] CaptureJpeg(JpegResolution resolution = JpegResolution.Res640x480, ushort skipFrames = 0)
+            => CaptureJpegProfiled(resolution, skipFrames, 0).ImageData;
+
+        /// <summary>
+        /// Capture JPEG and return timestamped phase markers for power profiling.
+        /// </summary>
+        public CaptureProfileResult CaptureJpegProfiled(
+            JpegResolution resolution = JpegResolution.Res640x480,
+            ushort skipFrames = 0,
+            int dwellMsBetweenSteps = 0)
         {
+            var profile = new List<PowerProfilePoint>();
+
+            void Mark(string step)
+            {
+                profile.Add(new PowerProfilePoint(DateTimeOffset.UtcNow, step));
+                LogMessage($"[PWR] {step}");
+            }
+
+            void Dwell()
+            {
+                if (dwellMsBetweenSteps > 0)
+                    Thread.Sleep(dwellMsBetweenSteps);
+            }
+
+            Mark("jpeg:start");
             EnsureSynced();
             FlushSerialBuffer();
+            Mark("jpeg:buffer_flushed");
+            Dwell();
 
             // 1. Reset state machine so repeated captures work
             //    Without this, the camera stays in "picture sent" state
             //    and subsequent INITIAL/SNAPSHOT commands fail.
             ResetStateMachine();
+            Mark("jpeg:state_reset");
+            Dwell();
 
             // 2. INITIAL – configure JPEG mode
             SendAndExpectAck(
                 CommandBuilder.Initial(ImageFormat.Jpeg, jpegRes: resolution),
                 CommandId.Initial, "INITIAL (JPEG)");
+            Mark("jpeg:initial_ack");
+            Dwell();
 
             // 3. SET PACKAGE SIZE
             SendAndExpectAck(
                 CommandBuilder.SetPackageSize(PackageSize),
                 CommandId.SetPackageSize, "SET PACKAGE SIZE");
+            Mark("jpeg:set_package_size_ack");
+            Dwell();
 
             // 4. SNAPSHOT – capture a frame
             //    Per nsstc-uae: sleep(1) after snapshot before GET_PICTURE
             SendAndExpectAck(
                 CommandBuilder.Snapshot(SnapshotType.Compressed, skipFrames),
                 CommandId.Snapshot, "SNAPSHOT");
+            Mark("jpeg:snapshot_ack");
             Thread.Sleep(1000);
+            Mark("jpeg:snapshot_settled");
+            Dwell();
 
             // 5. GET PICTURE with retry (per nsstc-uae reference)
             CameraResponse ack = default;
@@ -192,6 +252,7 @@ namespace UcamIII.Protocol
                 throw new CameraException($"Expected ACK for GET PICTURE after retries, got: {ack}");
             }
             LogMessage("  GET PICTURE acknowledged");
+            Mark("jpeg:get_picture_ack");
 
             // 6. Receive DATA response
             CameraResponse data = ReadResponse();
@@ -200,10 +261,13 @@ namespace UcamIII.Protocol
 
             int imageSize = data.ImageDataLength;
             LogMessage($"  Image size: {imageSize} bytes (type: {data.ResponseDataType})");
+            Mark($"jpeg:data_header size={imageSize}");
+            Dwell();
 
             // 7. Receive JPEG packages
             int dataPerPackage = PackageSize - 6; // 6 bytes overhead: 2 ID + 2 DataSize + 2 Verify
             int totalPackages = (imageSize + dataPerPackage - 1) / dataPerPackage;
+            Mark($"jpeg:transfer_start packages={totalPackages}");
 
             using (var imageStream = new MemoryStream(imageSize))
             {
@@ -243,12 +307,15 @@ namespace UcamIII.Protocol
                     if ((pkgId + 1) % 50 == 0 || pkgId == totalPackages - 1)
                         LogMessage($"  Package {pkgId + 1}/{totalPackages} received ({imageStream.Length}/{imageSize} bytes)");
                 }
+                Mark($"jpeg:transfer_done bytes={imageStream.Length}");
 
                 // 7. Send final ACK with F0F0 to end transfer
                 Send(CommandBuilder.Ack(0x00, 0x00, 0xF0F0));
+                Mark("jpeg:final_ack_sent");
                 LogMessage($"JPEG capture complete: {imageStream.Length} bytes");
+                Mark("jpeg:complete");
 
-                return imageStream.ToArray();
+                return new CaptureProfileResult(imageStream.ToArray(), profile);
             }
         }
 
@@ -258,27 +325,57 @@ namespace UcamIII.Protocol
         /// Capture a RAW image. RAW data is sent as a continuous byte stream (no packages).
         /// </summary>
         public byte[] CaptureRaw(ImageFormat format, RawResolution resolution)
+            => CaptureRawProfiled(format, resolution, 0).ImageData;
+
+        /// <summary>
+        /// Capture RAW image and return timestamped phase markers for power profiling.
+        /// </summary>
+        public CaptureProfileResult CaptureRawProfiled(ImageFormat format, RawResolution resolution, int dwellMsBetweenSteps = 0)
         {
+            var profile = new List<PowerProfilePoint>();
+
+            void Mark(string step)
+            {
+                profile.Add(new PowerProfilePoint(DateTimeOffset.UtcNow, step));
+                LogMessage($"[PWR] {step}");
+            }
+
+            void Dwell()
+            {
+                if (dwellMsBetweenSteps > 0)
+                    Thread.Sleep(dwellMsBetweenSteps);
+            }
+
+            Mark("raw:start");
             EnsureSynced();
             FlushSerialBuffer();
+            Mark("raw:buffer_flushed");
+            Dwell();
 
             if (format == ImageFormat.Jpeg)
                 throw new ArgumentException("Use CaptureJpeg() for JPEG format.");
 
             // Reset state machine for repeat captures
             ResetStateMachine();
+            Mark("raw:state_reset");
+            Dwell();
 
             // INITIAL – configure RAW mode
             SendAndExpectAck(
                 CommandBuilder.Initial(format, rawRes: resolution),
                 CommandId.Initial, "INITIAL (RAW)");
+            Mark("raw:initial_ack");
+            Dwell();
 
             // SNAPSHOT (uncompressed for RAW) + delay
             // Per nsstc-uae reference: snapshot with param1=0x01 for uncompressed
             SendAndExpectAck(
                 CommandBuilder.Snapshot(SnapshotType.Uncompressed),
                 CommandId.Snapshot, "SNAPSHOT (RAW)");
+            Mark("raw:snapshot_ack");
             Thread.Sleep(1000);
+            Mark("raw:snapshot_settled");
+            Dwell();
 
             // GET PICTURE (RAW) with retry
             CameraResponse ack = default;
@@ -300,6 +397,7 @@ namespace UcamIII.Protocol
 
             if (!gotAck)
                 throw new CameraException($"Expected ACK for GET PICTURE (RAW), got: {ack}");
+            Mark("raw:get_picture_ack");
 
             // Receive DATA response with size
             CameraResponse data = ReadResponse();
@@ -308,9 +406,13 @@ namespace UcamIII.Protocol
 
             int imageSize = data.ImageDataLength;
             LogMessage($"  RAW image size: {imageSize} bytes");
+            Mark($"raw:data_header size={imageSize}");
+            Dwell();
 
             // Read continuous stream
+            Mark("raw:transfer_start");
             byte[] imageData = ReadBytes(imageSize);
+            Mark($"raw:transfer_done bytes={imageData.Length}");
 
             // Send final ACK to tell camera RAW transfer is complete.
             // Per nsstc-uae: ACK(DATA, 0x00, packageId=0x0001)
@@ -318,9 +420,11 @@ namespace UcamIII.Protocol
             // Without this, the camera stays in "sending data" state
             // and subsequent captures fail.
             Send(CommandBuilder.Ack(CommandId.Data, 0x00, 0x0001));
+            Mark("raw:final_ack_sent");
             LogMessage($"RAW capture complete: {imageData.Length} bytes");
+            Mark("raw:complete");
 
-            return imageData;
+            return new CaptureProfileResult(imageData, profile);
         }
 
         /// <summary>

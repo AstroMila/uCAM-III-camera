@@ -45,6 +45,7 @@ namespace UcamIII.App
                         case "disconnect": CmdDisconnect(); break;
                         case "jpeg": CmdJpeg(parts); break;
                         case "raw": CmdRaw(parts); break;
+                        case "profile": CmdProfile(parts); break;
                         case "cbe": CmdCbe(parts); break;
                         case "light": CmdLight(parts); break;
                         case "sleep": CmdSleep(parts); break;
@@ -261,6 +262,131 @@ namespace UcamIII.App
             }
         }
 
+        static void CmdProfile(string[] parts)
+        {
+            EnsureConnected();
+
+            if (parts.Length < 2)
+            {
+                Console.WriteLine("Usage:");
+                Console.WriteLine("  profile jpeg [160|320|640] [dwellMs]");
+                Console.WriteLine("  profile raw [gray|rgb565|crycby] [80x60|160x120|128x128|128x96] [dwellMs]");
+                return;
+            }
+
+            string mode = parts[1].ToLowerInvariant();
+            if (mode == "jpeg")
+            {
+                JpegResolution res = JpegResolution.Res640x480;
+                int dwellMs = 0;
+
+                if (parts.Length >= 3)
+                {
+                    switch (parts[2])
+                    {
+                        case "160": res = JpegResolution.Res160x128; break;
+                        case "320": res = JpegResolution.Res320x240; break;
+                        case "640": res = JpegResolution.Res640x480; break;
+                        default:
+                            throw new ArgumentException(
+                                $"Unknown JPEG resolution '{parts[2]}'. Use: 160, 320, 640");
+                    }
+                }
+
+                if (parts.Length >= 4 && !int.TryParse(parts[3], out dwellMs))
+                    throw new ArgumentException("dwellMs must be an integer >= 0");
+                if (dwellMs < 0)
+                    throw new ArgumentException("dwellMs must be >= 0");
+
+                Console.WriteLine($"Profiling JPEG capture at {ResolutionToString(res)} (dwell={dwellMs}ms)...");
+                UcamCamera.CaptureProfileResult profile = _camera!.CaptureJpegProfiled(res, 0, dwellMs);
+
+                string baseName = $"ucam_profile_{DateTime.Now:yyyyMMdd_HHmmss}_jpeg_{ResolutionToString(res)}";
+                string jpgPath = Path.Combine(_outputDir, baseName + ".jpg");
+                string csvPath = Path.Combine(_outputDir, baseName + "_power.csv");
+
+                File.WriteAllBytes(jpgPath, profile.ImageData);
+                SaveProfileCsv(csvPath, profile.Points);
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"Saved image: {jpgPath} ({profile.ImageData.Length:N0} bytes)");
+                Console.WriteLine($"Saved profile: {csvPath} ({profile.Points.Count} points)");
+                Console.ResetColor();
+                return;
+            }
+
+            if (mode == "raw")
+            {
+                ImageFormat fmt = ImageFormat.GrayScale8Bit;
+                RawResolution res = RawResolution.Res160x120;
+                int dwellMs = 0;
+
+                if (parts.Length >= 3)
+                {
+                    switch (parts[2].ToLowerInvariant())
+                    {
+                        case "gray":
+                        case "grayscale": fmt = ImageFormat.GrayScale8Bit; break;
+                        case "rgb565":
+                        case "rgb": fmt = ImageFormat.ColorRgb565; break;
+                        case "crycby":
+                        case "yuv": fmt = ImageFormat.ColorCrYCbY; break;
+                        default:
+                            throw new ArgumentException(
+                                $"Unknown format '{parts[2]}'. Use: gray, rgb565, crycby");
+                    }
+                }
+
+                if (parts.Length >= 4)
+                {
+                    switch (parts[3].ToLowerInvariant())
+                    {
+                        case "80x60":
+                        case "80": res = RawResolution.Res80x60; break;
+                        case "160x120":
+                        case "160": res = RawResolution.Res160x120; break;
+                        case "128x128": res = RawResolution.Res128x128; break;
+                        case "128x96":
+                        case "128": res = RawResolution.Res128x96; break;
+                        default:
+                            throw new ArgumentException(
+                                $"Unknown resolution '{parts[3]}'. Use: 80x60, 160x120, 128x128, 128x96");
+                    }
+                }
+
+                if (parts.Length >= 5 && !int.TryParse(parts[4], out dwellMs))
+                    throw new ArgumentException("dwellMs must be an integer >= 0");
+                if (dwellMs < 0)
+                    throw new ArgumentException("dwellMs must be >= 0");
+
+                Console.WriteLine($"Profiling RAW capture ({fmt}, {RawResToString(res)}, dwell={dwellMs}ms)...");
+                UcamCamera.CaptureProfileResult profile = _camera!.CaptureRawProfiled(fmt, res, dwellMs);
+
+                string baseName = $"ucam_profile_{DateTime.Now:yyyyMMdd_HHmmss}_raw_{fmt}_{RawResToString(res)}";
+                string rawPath = Path.Combine(_outputDir, baseName + ".raw");
+                string csvPath = Path.Combine(_outputDir, baseName + "_power.csv");
+
+                File.WriteAllBytes(rawPath, profile.ImageData);
+                SaveProfileCsv(csvPath, profile.Points);
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"Saved image: {rawPath} ({profile.ImageData.Length:N0} bytes)");
+                Console.WriteLine($"Saved profile: {csvPath} ({profile.Points.Count} points)");
+                Console.ResetColor();
+
+                if (fmt == ImageFormat.GrayScale8Bit)
+                {
+                    GetRawDimensions(res, out int w, out int h);
+                    string pgmPath = Path.ChangeExtension(rawPath, ".pgm");
+                    SavePgm(pgmPath, profile.ImageData, w, h);
+                    Console.WriteLine($"  Also saved viewable PGM: {pgmPath}");
+                }
+                return;
+            }
+
+            throw new ArgumentException("Use: profile jpeg ... | profile raw ...");
+        }
+
         static void CmdCbe(string[] parts)
         {
             EnsureConnected();
@@ -426,6 +552,24 @@ namespace UcamIII.App
             }
         }
 
+        static void SaveProfileCsv(string path, System.Collections.Generic.IReadOnlyList<UcamCamera.PowerProfilePoint> points)
+        {
+            using (var writer = new StreamWriter(path))
+            {
+                writer.WriteLine("timestamp_utc,elapsed_ms,step");
+                if (points.Count == 0)
+                    return;
+
+                DateTimeOffset t0 = points[0].TimestampUtc;
+                foreach (UcamCamera.PowerProfilePoint p in points)
+                {
+                    double elapsedMs = (p.TimestampUtc - t0).TotalMilliseconds;
+                    string step = p.Step.Replace(",", ";");
+                    writer.WriteLine($"{p.TimestampUtc:O},{elapsedMs:F3},{step}");
+                }
+            }
+        }
+
         static void PrintHelp()
         {
             Console.WriteLine(@"
@@ -437,6 +581,10 @@ Commands:
   jpeg [160|320|640]        Capture JPEG snapshot (default: 640x480)
   raw [gray|rgb565|crycby] [80x60|160x120|128x128|128x96]
                             Capture RAW image (default: gray 160x120)
+    profile jpeg [160|320|640] [dwellMs]
+                                                        Capture JPEG + save power-phase CSV markers
+    profile raw [gray|rgb565|crycby] [80x60|160x120|128x128|128x96] [dwellMs]
+                                                        Capture RAW + save power-phase CSV markers
 
   cbe [contrast] [bright] [exposure]
                             Set contrast/brightness/exposure (each 0-4, 2=normal)
