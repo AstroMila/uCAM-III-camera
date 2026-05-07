@@ -117,6 +117,7 @@ Disconnected.
 ## Power Budget Measurement
 
 This project includes a built-in profiling mode to help measure camera current/power for each protocol phase.
+A concise lab-day checklist is provided at the end of this section.
 
 ### What profiling mode provides
 
@@ -191,6 +192,42 @@ RAW markers include:
 3. RAW gray and RAW RGB565
 4. `sleep 0` vs non-zero sleep timeout behavior
 5. Repeat captures (`profile ...` multiple times) to confirm stable average and peak current
+
+### Lab-Day Quick Checklist
+
+Use this when running camera power measurements in the lab.
+
+1. **Wiring and instrument**
+  - Camera at 5V, shared GND with USB-TTL and measurement instrument
+  - UART connected (TX↔RX crossed, GND common)
+  - Current meter in series with camera VCC
+
+2. **Start logging**
+  - Start current/power logging on the instrument before camera commands
+  - Note test ID/time in lab notes
+
+3. **Connect and verify**
+  - `connect COM3 115200`
+  - `status`
+
+4. **Run profile captures**
+  - `profile jpeg 160 500`
+  - `profile jpeg 320 500`
+  - `profile jpeg 640 500`
+  - `profile raw gray 128x96 500`
+  - `profile raw rgb565 160x120 500`
+
+5. **Collect artifacts**
+  - Instrument export (current/power trace)
+  - CLI CSV (`*_power.csv`)
+  - Captured image (`.jpg` / `.raw` / `.pgm`)
+
+6. **Validate markers**
+  - Confirm CSV includes expected phase steps (`initial_ack`, `snapshot_ack`, `transfer_start`, `final_ack_sent`, `complete`)
+
+7. **Repeatability**
+  - Run each case at least 3 times
+  - Report average and peak values per phase
 
 ## Project Structure
 
