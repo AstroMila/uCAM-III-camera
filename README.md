@@ -76,6 +76,7 @@ profile jpeg [160|320|640] [dwellMs]
                                Capture JPEG + save phase markers CSV for power profiling
 profile raw [gray|rgb565|crycby] [80x60|160x120|128x128|128x96] [dwellMs]
                                Capture RAW + save phase markers CSV for power profiling
+step ...                       Manual step-by-step protocol control for power testing
 
 cbe [contrast] [brightness] [exposure]
                                Set image adjustment (each: min|low|normal|high|max or 0-4)
@@ -149,6 +150,9 @@ profile jpeg 640
 # JPEG profile, hold ~500 ms between major phases
 profile jpeg 640 500
 
+# IMPORTANT: include max JPEG resolution in every campaign
+# (640 = 640x480, highest supported JPEG size)
+
 # RAW grayscale profile with dwell
 profile raw gray 128x96 500
 
@@ -185,10 +189,65 @@ RAW markers include:
 - `raw:transfer_done bytes=...`
 - `raw:final_ack_sent`
 
+### Manual Step Mode (one phase at a time)
+
+Use this mode when you need to hold the camera at specific protocol phases and measure power manually.
+
+Core commands:
+
+- `step help`
+- `step flush`
+- `step reset`
+- `step wait <ms>`
+- `step init jpeg <160|320|640>`
+- `step init raw <gray|rgb565|crycby> <80x60|160x120|128x128|128x96>`
+- `step pkg [size]`
+- `step snapshot jpeg [skipFrames]`
+- `step snapshot raw`
+- `step getpic jpeg|raw`
+- `step recv [count|all]` (JPEG: packages; RAW is auto-buffered during `step getpic raw`)
+- `step finish` (sends final ACK and saves image)
+- `step status`
+- `step clear`
+
+JPEG manual flow example:
+
+```text
+connect COM3 115200
+step reset
+step init jpeg 640
+step pkg 512
+step snapshot jpeg
+step wait 1000
+step getpic jpeg
+step recv 1
+step recv all
+step finish
+```
+
+RAW manual flow example:
+
+```text
+connect COM3 115200
+step reset
+step init raw gray 128x96
+step snapshot raw
+step wait 1000
+step getpic raw
+step finish
+```
+
+Notes:
+
+- `step finish` is required; it sends the final ACK that returns the camera to ready state.
+- You can insert `step wait <ms>` between any commands to create stable measurement plateaus.
+- For max JPEG power case, use `step init jpeg 640` (which is 640x480).
+- RAW cannot be cleanly split into `getpic` and later `recv` because the camera starts streaming RAW bytes immediately after `GET_PICTURE`; the app now buffers RAW automatically during `step getpic raw`.
+
 ### Suggested power budget campaign
 
 1. Baseline idle (connected, no capture)
-2. JPEG at 160/320/640
+2. JPEG at 160/320/640 (**always include 640x480 max resolution**)
 3. RAW gray and RAW RGB565
 4. `sleep 0` vs non-zero sleep timeout behavior
 5. Repeat captures (`profile ...` multiple times) to confirm stable average and peak current
@@ -213,7 +272,7 @@ Use this when running camera power measurements in the lab.
 4. **Run profile captures**
   - `profile jpeg 160 500`
   - `profile jpeg 320 500`
-  - `profile jpeg 640 500`
+  - `profile jpeg 640 500` (**mandatory max JPEG test**)
   - `profile raw gray 128x96 500`
   - `profile raw rgb565 160x120 500`
 

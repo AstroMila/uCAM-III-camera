@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Ports;
 using System.Linq;
@@ -8,8 +9,24 @@ namespace UcamIII.App
 {
     class Program
     {
+        sealed class ManualTransferSession
+        {
+            public PictureType PictureType { get; set; }
+            public ImageFormat? RawFormat { get; set; }
+            public RawResolution? RawResolution { get; set; }
+            public JpegResolution? JpegResolution { get; set; }
+            public int ExpectedBytes { get; set; }
+            public int ReceivedBytes { get; set; }
+            public int NextPackageId { get; set; }
+            public MemoryStream Buffer { get; } = new MemoryStream();
+        }
+
         private static UcamCamera? _camera;
         private static string _outputDir = "captures";
+        private static ImageFormat? _stepRawFormat;
+        private static RawResolution? _stepRawResolution;
+        private static JpegResolution? _stepJpegResolution;
+        private static ManualTransferSession? _manualTransfer;
 
         static void Main(string[] args)
         {
@@ -46,6 +63,7 @@ namespace UcamIII.App
                         case "jpeg": CmdJpeg(parts); break;
                         case "raw": CmdRaw(parts); break;
                         case "profile": CmdProfile(parts); break;
+                        case "step": CmdStep(parts); break;
                         case "cbe": CmdCbe(parts); break;
                         case "light": CmdLight(parts); break;
                         case "sleep": CmdSleep(parts); break;
@@ -387,6 +405,84 @@ namespace UcamIII.App
             throw new ArgumentException("Use: profile jpeg ... | profile raw ...");
         }
 
+        static void CmdStep(string[] parts)
+        {
+            EnsureConnected();
+
+            if (parts.Length < 2)
+            {
+                PrintStepHelp();
+                return;
+            }
+
+            string action = parts[1].ToLowerInvariant();
+            switch (action)
+            {
+                case "help":
+                    PrintStepHelp();
+                    return;
+
+                case "flush":
+                    _camera!.FlushInputBuffer();
+                    Console.WriteLine("Input buffer flushed.");
+                    return;
+
+                case "reset":
+                case "resetstate":
+                    _camera!.ResetStateMachineOnly();
+                    _manualTransfer = null;
+                    Console.WriteLine("Camera state machine reset.");
+                    return;
+
+                case "wait":
+                    if (parts.Length < 3 || !int.TryParse(parts[2], out int delayMs) || delayMs < 0)
+                        throw new ArgumentException("Use: step wait <milliseconds>");
+                    Console.WriteLine($"Waiting {delayMs} ms...");
+                    _camera!.Delay(delayMs);
+                    return;
+
+                case "init":
+                    StepInit(parts);
+                    return;
+
+                case "pkg":
+                    ushort size = 512;
+                    if (parts.Length >= 3 && !ushort.TryParse(parts[2], out size))
+                        throw new ArgumentException("Use: step pkg [size]");
+                    _camera!.ConfigurePackageSize(size);
+                    Console.WriteLine($"Package size set to {size} bytes.");
+                    return;
+
+                case "snapshot":
+                    StepSnapshot(parts);
+                    return;
+
+                case "getpic":
+                    StepGetPicture(parts);
+                    return;
+
+                case "recv":
+                    StepReceive(parts);
+                    return;
+
+                case "finish":
+                    StepFinish();
+                    return;
+
+                case "clear":
+                    _manualTransfer = null;
+                    Console.WriteLine("Cleared manual transfer session.");
+                    return;
+
+                case "status":
+                    StepStatus();
+                    return;
+
+                default:
+                    throw new ArgumentException("Unknown step action. Use 'step help'.");
+            }
+        }
+
         static void CmdCbe(string[] parts)
         {
             EnsureConnected();
@@ -478,6 +574,311 @@ namespace UcamIII.App
             Console.WriteLine($"Synced:     {_camera.IsSynced}");
             Console.WriteLine($"Pkg size:   {_camera.PackageSize}");
             Console.WriteLine($"Output dir: {Path.GetFullPath(_outputDir)}");
+        }
+
+        static void StepInit(string[] parts)
+        {
+            if (parts.Length < 3)
+                throw new ArgumentException("Use: step init jpeg <160|320|640> | step init raw <gray|rgb565|crycby> <80x60|160x120|128x128|128x96>");
+
+            string mode = parts[2].ToLowerInvariant();
+            _manualTransfer = null;
+
+            if (mode == "jpeg")
+            {
+                if (parts.Length < 4)
+                    throw new ArgumentException("Use: step init jpeg <160|320|640>");
+
+                JpegResolution res;
+                switch (parts[3])
+                {
+                    case "160": res = JpegResolution.Res160x128; break;
+                    case "320": res = JpegResolution.Res320x240; break;
+                    case "640": res = JpegResolution.Res640x480; break;
+                    default: throw new ArgumentException("Use: step init jpeg <160|320|640>");
+                }
+
+                _camera!.InitializeJpeg(res);
+                _stepJpegResolution = res;
+                _stepRawFormat = null;
+                _stepRawResolution = null;
+                Console.WriteLine($"JPEG initialized: {ResolutionToString(res)}.");
+                return;
+            }
+
+            if (mode == "raw")
+            {
+                if (parts.Length < 5)
+                    throw new ArgumentException("Use: step init raw <gray|rgb565|crycby> <80x60|160x120|128x128|128x96>");
+
+                ImageFormat fmt;
+                switch (parts[3].ToLowerInvariant())
+                {
+                    case "gray":
+                    case "grayscale": fmt = ImageFormat.GrayScale8Bit; break;
+                    case "rgb565":
+                    case "rgb": fmt = ImageFormat.ColorRgb565; break;
+                    case "crycby":
+                    case "yuv": fmt = ImageFormat.ColorCrYCbY; break;
+                    default: throw new ArgumentException("Use: step init raw <gray|rgb565|crycby> <80x60|160x120|128x128|128x96>");
+                }
+
+                RawResolution res;
+                switch (parts[4].ToLowerInvariant())
+                {
+                    case "80x60":
+                    case "80": res = RawResolution.Res80x60; break;
+                    case "160x120":
+                    case "160": res = RawResolution.Res160x120; break;
+                    case "128x128": res = RawResolution.Res128x128; break;
+                    case "128x96":
+                    case "128": res = RawResolution.Res128x96; break;
+                    default: throw new ArgumentException("Use: step init raw <gray|rgb565|crycby> <80x60|160x120|128x128|128x96>");
+                }
+
+                _camera!.InitializeRaw(fmt, res);
+                _stepRawFormat = fmt;
+                _stepRawResolution = res;
+                _stepJpegResolution = null;
+                Console.WriteLine($"RAW initialized: {fmt}, {RawResToString(res)}.");
+                return;
+            }
+
+            throw new ArgumentException("Use: step init jpeg ... | step init raw ...");
+        }
+
+        static void StepSnapshot(string[] parts)
+        {
+            if (parts.Length < 3)
+                throw new ArgumentException("Use: step snapshot jpeg [skipFrames] | step snapshot raw");
+
+            string mode = parts[2].ToLowerInvariant();
+            if (mode == "jpeg")
+            {
+                ushort skipFrames = 0;
+                if (parts.Length >= 4 && !ushort.TryParse(parts[3], out skipFrames))
+                    throw new ArgumentException("Use: step snapshot jpeg [skipFrames]");
+
+                _camera!.SnapshotCompressed(skipFrames);
+                Console.WriteLine("JPEG snapshot taken.");
+                return;
+            }
+
+            if (mode == "raw")
+            {
+                _camera!.SnapshotUncompressed();
+                Console.WriteLine("RAW snapshot taken.");
+                return;
+            }
+
+            throw new ArgumentException("Use: step snapshot jpeg|raw");
+        }
+
+        static void StepGetPicture(string[] parts)
+        {
+            if (parts.Length < 3)
+                throw new ArgumentException("Use: step getpic jpeg|raw");
+
+            string mode = parts[2].ToLowerInvariant();
+            if (mode == "jpeg")
+            {
+                CameraResponse data = _camera!.BeginPictureTransfer(PictureType.Snapshot);
+                _manualTransfer = new ManualTransferSession
+                {
+                    PictureType = PictureType.Snapshot,
+                    JpegResolution = _stepJpegResolution,
+                    ExpectedBytes = data.ImageDataLength,
+                    ReceivedBytes = 0,
+                    NextPackageId = 0,
+                };
+                int dataPerPackage = _camera.PackageSize - 6;
+                int totalPackages = (data.ImageDataLength + dataPerPackage - 1) / dataPerPackage;
+                Console.WriteLine($"JPEG transfer started: {data.ImageDataLength} bytes, {totalPackages} package(s).");
+                return;
+            }
+
+            if (mode == "raw")
+            {
+                CameraResponse data = _camera!.BeginPictureTransfer(PictureType.Raw);
+                _manualTransfer = new ManualTransferSession
+                {
+                    PictureType = PictureType.Raw,
+                    RawFormat = _stepRawFormat,
+                    RawResolution = _stepRawResolution,
+                    ExpectedBytes = data.ImageDataLength,
+                    ReceivedBytes = 0,
+                    NextPackageId = 0,
+                };
+                Console.WriteLine($"RAW transfer started: {data.ImageDataLength} bytes.");
+                Console.WriteLine("RAW uses a continuous unpaced stream; receiving all bytes immediately...");
+
+                byte[] rawBytes = _camera.ReadRawTransferChunk(data.ImageDataLength);
+                _manualTransfer.Buffer.Write(rawBytes, 0, rawBytes.Length);
+                _manualTransfer.ReceivedBytes = rawBytes.Length;
+
+                Console.WriteLine($"RAW stream buffered: {_manualTransfer.ReceivedBytes}/{_manualTransfer.ExpectedBytes} bytes.");
+                Console.WriteLine("Use 'step finish' to send final ACK and save file.");
+                return;
+            }
+
+            throw new ArgumentException("Use: step getpic jpeg|raw");
+        }
+
+        static void StepReceive(string[] parts)
+        {
+            if (_manualTransfer == null)
+                throw new CameraException("No active manual transfer. Use 'step getpic ...' first.");
+
+            if (_manualTransfer.PictureType == PictureType.Snapshot)
+            {
+                int dataPerPackage = _camera!.PackageSize - 6;
+                int totalPackages = (_manualTransfer.ExpectedBytes + dataPerPackage - 1) / dataPerPackage;
+                int packagesToRead = 1;
+
+                if (parts.Length >= 3)
+                {
+                    if (parts[2].ToLowerInvariant() == "all")
+                        packagesToRead = totalPackages - _manualTransfer.NextPackageId;
+                    else if (!int.TryParse(parts[2], out packagesToRead) || packagesToRead < 1)
+                        throw new ArgumentException("Use: step recv [count|all]");
+                }
+
+                for (int i = 0; i < packagesToRead && _manualTransfer.NextPackageId < totalPackages; i++)
+                {
+                    var pkg = _camera.ReadJpegTransferPackage((ushort)_manualTransfer.NextPackageId);
+                    _manualTransfer.Buffer.Write(pkg.Payload, 0, pkg.Payload.Length);
+                    _manualTransfer.ReceivedBytes += pkg.Payload.Length;
+                    _manualTransfer.NextPackageId++;
+                }
+
+                Console.WriteLine($"JPEG progress: package {_manualTransfer.NextPackageId}/{totalPackages}, {_manualTransfer.ReceivedBytes}/{_manualTransfer.ExpectedBytes} bytes.");
+                if (_manualTransfer.NextPackageId >= totalPackages)
+                    Console.WriteLine("All JPEG packages received. Use 'step finish' to send final ACK and save file.");
+                return;
+            }
+
+            if (_manualTransfer.PictureType == PictureType.Raw)
+            {
+                int remaining = _manualTransfer.ExpectedBytes - _manualTransfer.ReceivedBytes;
+                if (remaining <= 0)
+                {
+                    Console.WriteLine("All RAW bytes were already buffered during 'step getpic raw'. Use 'step finish' to send final ACK and save file.");
+                    return;
+                }
+
+                int bytesToRead = remaining;
+                if (parts.Length >= 3)
+                {
+                    if (parts[2].ToLowerInvariant() != "all")
+                    {
+                        if (!int.TryParse(parts[2], out bytesToRead) || bytesToRead < 1)
+                            throw new ArgumentException("Use: step recv [byteCount|all]");
+                        bytesToRead = Math.Min(bytesToRead, remaining);
+                    }
+                }
+
+                byte[] chunk = _camera!.ReadRawTransferChunk(bytesToRead);
+                _manualTransfer.Buffer.Write(chunk, 0, chunk.Length);
+                _manualTransfer.ReceivedBytes += chunk.Length;
+                Console.WriteLine($"RAW progress: {_manualTransfer.ReceivedBytes}/{_manualTransfer.ExpectedBytes} bytes.");
+                if (_manualTransfer.ReceivedBytes >= _manualTransfer.ExpectedBytes)
+                    Console.WriteLine("All RAW bytes received. Use 'step finish' to send final ACK and save file.");
+                return;
+            }
+        }
+
+        static void StepFinish()
+        {
+            if (_manualTransfer == null)
+                throw new CameraException("No active manual transfer to finish.");
+
+            string savedPath;
+            if (_manualTransfer.PictureType == PictureType.Snapshot)
+            {
+                _camera!.FinishJpegTransfer();
+                string resText = _manualTransfer.JpegResolution.HasValue ? ResolutionToString(_manualTransfer.JpegResolution.Value) : "jpeg";
+                savedPath = Path.Combine(_outputDir, $"ucam_step_{DateTime.Now:yyyyMMdd_HHmmss}_{resText}.jpg");
+                File.WriteAllBytes(savedPath, _manualTransfer.Buffer.ToArray());
+            }
+            else
+            {
+                _camera!.FinishRawTransfer();
+                string fmtText = _manualTransfer.RawFormat?.ToString() ?? "raw";
+                string resText = _manualTransfer.RawResolution.HasValue ? RawResToString(_manualTransfer.RawResolution.Value) : "raw";
+                savedPath = Path.Combine(_outputDir, $"ucam_step_{DateTime.Now:yyyyMMdd_HHmmss}_{fmtText}_{resText}.raw");
+                byte[] bytes = _manualTransfer.Buffer.ToArray();
+                File.WriteAllBytes(savedPath, bytes);
+
+                if (_manualTransfer.RawFormat == ImageFormat.GrayScale8Bit && _manualTransfer.RawResolution.HasValue)
+                {
+                    GetRawDimensions(_manualTransfer.RawResolution.Value, out int w, out int h);
+                    string pgmPath = Path.ChangeExtension(savedPath, ".pgm");
+                    SavePgm(pgmPath, bytes, w, h);
+                    Console.WriteLine($"Also saved viewable PGM: {pgmPath}");
+                }
+            }
+
+            Console.WriteLine($"Saved manual transfer output: {savedPath}");
+            _manualTransfer = null;
+        }
+
+        static void StepStatus()
+        {
+            Console.WriteLine($"Step JPEG init: {(_stepJpegResolution.HasValue ? ResolutionToString(_stepJpegResolution.Value) : "<none>")}");
+            Console.WriteLine($"Step RAW init:  {(_stepRawFormat.HasValue && _stepRawResolution.HasValue ? $"{_stepRawFormat.Value}, {RawResToString(_stepRawResolution.Value)}" : "<none>")}");
+            if (_manualTransfer == null)
+            {
+                Console.WriteLine("Manual transfer: <none>");
+                return;
+            }
+
+            Console.WriteLine($"Manual transfer type: {_manualTransfer.PictureType}");
+            Console.WriteLine($"Expected bytes:       {_manualTransfer.ExpectedBytes}");
+            Console.WriteLine($"Received bytes:       {_manualTransfer.ReceivedBytes}");
+            if (_manualTransfer.PictureType == PictureType.Snapshot)
+                Console.WriteLine($"Next package id:      {_manualTransfer.NextPackageId}");
+        }
+
+        static void PrintStepHelp()
+        {
+            Console.WriteLine(@"
+Manual step commands:
+  step help
+  step flush
+  step reset
+  step wait <ms>
+  step init jpeg <160|320|640>
+  step init raw <gray|rgb565|crycby> <80x60|160x120|128x128|128x96>
+  step pkg [size]
+  step snapshot jpeg [skipFrames]
+  step snapshot raw
+  step getpic jpeg|raw
+  step recv [count|all]        # JPEG: packages, RAW: bytes or all
+  step finish                  # send final ACK and save current transfer
+  step clear
+  step status
+
+Example JPEG manual flow:
+  step reset
+  step init jpeg 640
+  step pkg 512
+  step snapshot jpeg
+  step wait 1000
+  step getpic jpeg
+  step recv 1
+  step recv all
+  step finish
+
+Example RAW manual flow:
+  step reset
+  step init raw gray 128x96
+  step snapshot raw
+  step wait 1000
+  step getpic raw
+  step finish
+
+Note: RAW begins streaming immediately after `step getpic raw`, so the app buffers the RAW bytes automatically.
+");
         }
 
         // ── Helpers ──────────────────────────────────────────────────
@@ -585,6 +986,7 @@ Commands:
                                                         Capture JPEG + save power-phase CSV markers
     profile raw [gray|rgb565|crycby] [80x60|160x120|128x128|128x96] [dwellMs]
                                                         Capture RAW + save power-phase CSV markers
+    step ...                  Manual step-by-step protocol control for power testing
 
   cbe [contrast] [bright] [exposure]
                             Set contrast/brightness/exposure (each 0-4, 2=normal)
