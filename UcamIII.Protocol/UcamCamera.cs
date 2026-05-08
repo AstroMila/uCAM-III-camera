@@ -37,6 +37,24 @@ namespace UcamIII.Protocol
             }
         }
 
+        public readonly struct JpegTransferPackage
+        {
+            public int RequestedPackageId { get; }
+            public int ReceivedPackageId { get; }
+            public int DataSize { get; }
+            public bool ChecksumOk { get; }
+            public byte[] Payload { get; }
+
+            public JpegTransferPackage(int requestedPackageId, int receivedPackageId, int dataSize, bool checksumOk, byte[] payload)
+            {
+                RequestedPackageId = requestedPackageId;
+                ReceivedPackageId = receivedPackageId;
+                DataSize = dataSize;
+                ChecksumOk = checksumOk;
+                Payload = payload;
+            }
+        }
+
         private readonly SerialPort _port;
         private bool _synced;
         private bool _disposed;
@@ -452,6 +470,158 @@ namespace UcamIII.Protocol
             }
 
             return w * h * bpp;
+        }
+
+        // ── Manual Step Control ─────────────────────────────────────
+
+        public void FlushInputBuffer()
+        {
+            FlushSerialBuffer();
+        }
+
+        public void ResetStateMachineOnly()
+        {
+            EnsureSynced();
+            ResetStateMachine();
+        }
+
+        public void InitializeJpeg(JpegResolution resolution)
+        {
+            EnsureSynced();
+            SendAndExpectAck(
+                CommandBuilder.Initial(ImageFormat.Jpeg, jpegRes: resolution),
+                CommandId.Initial, "INITIAL (JPEG)");
+        }
+
+        public void InitializeRaw(ImageFormat format, RawResolution resolution)
+        {
+            EnsureSynced();
+            if (format == ImageFormat.Jpeg)
+                throw new ArgumentException("Use InitializeJpeg() for JPEG mode.");
+
+            SendAndExpectAck(
+                CommandBuilder.Initial(format, rawRes: resolution),
+                CommandId.Initial, "INITIAL (RAW)");
+        }
+
+        public void ConfigurePackageSize(ushort size = 512)
+        {
+            EnsureSynced();
+            PackageSize = size;
+            SendAndExpectAck(
+                CommandBuilder.SetPackageSize(size),
+                CommandId.SetPackageSize, "SET PACKAGE SIZE");
+        }
+
+        public void SnapshotCompressed(ushort skipFrames = 0)
+        {
+            EnsureSynced();
+            SendAndExpectAck(
+                CommandBuilder.Snapshot(SnapshotType.Compressed, skipFrames),
+                CommandId.Snapshot, "SNAPSHOT");
+        }
+
+        public void SnapshotUncompressed()
+        {
+            EnsureSynced();
+            SendAndExpectAck(
+                CommandBuilder.Snapshot(SnapshotType.Uncompressed),
+                CommandId.Snapshot, "SNAPSHOT (RAW)");
+        }
+
+        public CameraResponse BeginPictureTransfer(PictureType type, int retries = 5, int ackTimeoutMs = 5000)
+        {
+            EnsureSynced();
+
+            CameraResponse ack = default;
+            bool gotAck = false;
+            for (int attempt = 0; attempt < retries; attempt++)
+            {
+                Send(CommandBuilder.GetPicture(type));
+                Thread.Sleep(100);
+
+                ack = ReadResponseWithTimeout(ackTimeoutMs);
+                if (ack.IsAck && ack.AckedCommandId == CommandId.GetPicture)
+                {
+                    gotAck = true;
+                    break;
+                }
+
+                LogMessage($"  GET PICTURE ({type}) attempt {attempt + 1} got: {ack}, retrying...");
+                Thread.Sleep(100);
+            }
+
+            if (!gotAck)
+            {
+                if (ack.IsNak)
+                    throw new CameraException($"GET PICTURE rejected: {ack.NakErrorCode}", ack.NakErrorCode);
+                throw new CameraException($"Expected ACK for GET PICTURE, got: {ack}");
+            }
+
+            LogMessage($"  GET PICTURE ({type}) acknowledged");
+
+            CameraResponse data = ReadResponse();
+            if (!data.IsData)
+                throw new CameraException($"Expected DATA response, got: {data}");
+
+            LogMessage($"  DATA header: type={data.ResponseDataType}, size={data.ImageDataLength} bytes");
+            return data;
+        }
+
+        public JpegTransferPackage ReadJpegTransferPackage(ushort packageId)
+        {
+            EnsureSynced();
+
+            Send(CommandBuilder.Ack(0x00, 0x00, packageId));
+            byte[] package = ReadPackage(PackageSize);
+
+            int receivedId = package[0] | (package[1] << 8);
+            int dataSize = package[2] | (package[3] << 8);
+
+            int checksumCalc = 0;
+            for (int i = 0; i < 4 + dataSize; i++)
+                checksumCalc += package[i];
+
+            byte expectedVerify = (byte)(checksumCalc & 0xFF);
+            byte actualVerify = package[4 + dataSize];
+            bool checksumOk = expectedVerify == actualVerify;
+
+            byte[] payload = new byte[dataSize];
+            Array.Copy(package, 4, payload, 0, dataSize);
+
+            if (!checksumOk)
+                LogMessage($"  WARNING: Package {receivedId} checksum mismatch: expected 0x{expectedVerify:X2}, got 0x{actualVerify:X2}");
+
+            return new JpegTransferPackage(packageId, receivedId, dataSize, checksumOk, payload);
+        }
+
+        public byte[] ReadRawTransferChunk(int byteCount)
+        {
+            EnsureSynced();
+            if (byteCount < 0)
+                throw new ArgumentException("byteCount must be >= 0");
+            return ReadBytes(byteCount);
+        }
+
+        public void FinishJpegTransfer()
+        {
+            EnsureSynced();
+            Send(CommandBuilder.Ack(0x00, 0x00, 0xF0F0));
+            LogMessage("JPEG final ACK sent");
+        }
+
+        public void FinishRawTransfer()
+        {
+            EnsureSynced();
+            Send(CommandBuilder.Ack(CommandId.Data, 0x00, 0x0001));
+            LogMessage("RAW final ACK sent");
+        }
+
+        public void Delay(int milliseconds)
+        {
+            if (milliseconds < 0)
+                throw new ArgumentException("Delay must be >= 0 ms");
+            Thread.Sleep(milliseconds);
         }
 
         // ── Camera Settings ──────────────────────────────────────────
